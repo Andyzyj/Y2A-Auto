@@ -11,7 +11,7 @@ fi
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOST="${HOST:-127.0.0.1}"
-export PORT="${PORT:-5000}"
+export PORT="${PORT:-5051}"
 export PYTHONUNBUFFERED=1
 export PYTHONIOENCODING=utf-8
 

@@ -21,7 +21,8 @@ scripts/setup_macos.sh
 scripts/run_macos.sh
 ```
 
-Open <http://127.0.0.1:5000>. Set `HOST=0.0.0.0` only when LAN access is
+Open <http://127.0.0.1:5051>. Port 5051 avoids the AirPlay receiver that can
+occupy port 5000 on macOS. Set `HOST=0.0.0.0` only when LAN access is
 intended and login protection has been configured.
 
 Runtime configuration, cookies, the database, logs, downloads, and the Python
