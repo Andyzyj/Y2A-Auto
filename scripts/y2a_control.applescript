@@ -1,7 +1,7 @@
 set mainLabel to "com.andyzyj.y2a-auto"
 set whisperLabel to "com.andyzyj.y2a-whisper"
-set userID to do shell script "/usr/bin/id -u"
-set guiDomain to "gui/" & userID
+set currentUserID to (do shell script "/usr/bin/id -u")
+set guiDomain to "gui/" & currentUserID
 
 set mainLoaded to my serviceIsLoaded(guiDomain, mainLabel)
 set whisperLoaded to my serviceIsLoaded(guiDomain, whisperLabel)
@@ -22,8 +22,8 @@ if chosenButton is "停止运行" then
 	display notification "Y2A 与本地 Whisper 已停止，配置、模型和任务数据仍会保留。" with title "Y2A 控制"
 else if chosenButton is "启动并打开" then
 	try
-		my startService(guiDomain, userID, whisperLabel)
-		my startService(guiDomain, userID, mainLabel)
+		my startService(guiDomain, currentUserID, whisperLabel)
+		my startService(guiDomain, currentUserID, mainLabel)
 	on error errorMessage
 		display alert "启动失败" message errorMessage as critical
 		return
@@ -53,12 +53,12 @@ on serviceIsLoaded(guiDomain, serviceLabel)
 	end try
 end serviceIsLoaded
 
-on startService(guiDomain, userID, serviceLabel)
+on startService(guiDomain, currentUserID, serviceLabel)
 	set serviceTarget to guiDomain & "/" & serviceLabel
 	set plistPath to POSIX path of (path to home folder) & "Library/LaunchAgents/" & serviceLabel & ".plist"
 	if not my serviceIsLoaded(guiDomain, serviceLabel) then
 		try
-			do shell script "/bin/launchctl bootstrap gui/" & userID & " " & quoted form of plistPath
+			do shell script "/bin/launchctl bootstrap gui/" & currentUserID & " " & quoted form of plistPath
 		on error errorMessage
 			if errorMessage does not contain "service already loaded" and errorMessage does not contain "Input/output error" then error errorMessage
 		end try
