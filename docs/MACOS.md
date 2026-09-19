@@ -6,8 +6,15 @@ on the local machine by default.
 ## Requirements
 
 ```bash
-brew install python@3.11 ffmpeg deno
+brew install python@3.11 ffmpeg@7 deno
 ```
+
+Y2A requires FFmpeg's `subtitles` filter (libass) to burn captions into video.
+The setup script checks for that filter and defaults to the versioned Homebrew
+binary at `/opt/homebrew/opt/ffmpeg@7/bin/ffmpeg`. In Y2A settings, set
+`FFMPEG_LOCATION` to that path. A different FFmpeg build can be used by passing
+`FFMPEG_BIN` and `FFPROBE_BIN` when running the setup script, provided it
+includes the `subtitles` filter.
 
 ## Install
 
