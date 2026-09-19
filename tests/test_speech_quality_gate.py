@@ -88,6 +88,25 @@ class SubtitleEmbedAllowedGateTests(unittest.TestCase):
     def test_qc_failed_blocks_embed(self):
         self.assertFalse(tm._subtitle_embed_allowed({}, 'ok', True))
 
+    def test_local_whisper_result_is_never_blocked(self):
+        config = {
+            'SPEECH_RECOGNITION_ENABLED': True,
+            'SPEECH_RECOGNITION_PROVIDER': 'whisper',
+            'WHISPER_BASE_URL': 'http://127.0.0.1:5052/v1',
+        }
+        self.assertTrue(tm._is_local_speech_recognition(config))
+        self.assertTrue(tm._subtitle_embed_allowed(config, 'failed', True))
+        self.assertEqual(tm._subtitle_block_reasons(config, 'degraded', True), [])
+
+    def test_remote_whisper_keeps_quality_gate(self):
+        config = {
+            'SPEECH_RECOGNITION_ENABLED': True,
+            'SPEECH_RECOGNITION_PROVIDER': 'whisper',
+            'WHISPER_BASE_URL': 'https://api.openai.com/v1',
+        }
+        self.assertFalse(tm._is_local_speech_recognition(config))
+        self.assertFalse(tm._subtitle_embed_allowed(config, 'failed', True))
+
     def test_qc_failed_but_cleared_allows_embed(self):
         self.assertTrue(tm._subtitle_embed_allowed({}, 'ok', True, qc_cleared=True))
 
@@ -224,6 +243,26 @@ class _TranslateSubtitleHarness(unittest.TestCase):
 
 
 class TranslateSubtitleQualityGateTests(_TranslateSubtitleHarness):
+    def test_local_failed_quality_state_continues_to_embed(self):
+        task = self.base_task(self.task_id)
+        task['video_path_local'] = self.video_path
+        recognizer = self._make_recognizer('failed', ['vad_no_speech'])
+        config = {
+            'SPEECH_RECOGNITION_ENABLED': True,
+            'SPEECH_RECOGNITION_PROVIDER': 'whisper',
+            'WHISPER_BASE_URL': 'http://localhost:5052/v1',
+        }
+
+        processor, result = self.run_translate(
+            task, config, recognizer,
+            translation_enabled=False, embed_enabled=True,
+            qc_side_effect=[True],
+        )
+
+        self.assertTrue(result)
+        processor._embed_subtitle_in_video.assert_called_once()
+        self.assertEqual(self.last_value('subtitle_warning_message'), None)
+
     def test_failed_quality_state_blocks_embed_and_keeps_checkpoint_clean(self):
         task = self.base_task(self.task_id)
         task['video_path_local'] = self.video_path
@@ -770,6 +809,37 @@ class RunSubtitleQcTriStateTests(unittest.TestCase):
         result = self._run({'SUBTITLE_QC_ENABLED': True}, run_return=qc_result)
         self.assertIs(result, False)
         self.assertEqual(self.updates[-1]['subtitle_qc_failed'], 1)
+
+    def test_local_asr_qc_failure_is_advisory_and_continues(self):
+        qc_result = MagicMock(passed=False, reason='rule_fail:timeline_coverage_too_low',
+                              score=0.2, rule_score=0.2, ai_score=None,
+                              decision='rule_fail', sample_items=0, sample_chars=0,
+                              raw_ai={'ai_mode': 'strict', 'ai_override': False})
+        result = self._run({
+            'SUBTITLE_QC_ENABLED': True,
+            'SPEECH_RECOGNITION_ENABLED': True,
+            'SPEECH_RECOGNITION_PROVIDER': 'whisper',
+            'WHISPER_BASE_URL': 'http://127.0.0.1:5052/v1',
+        }, run_return=qc_result)
+        self.assertIs(result, True)
+        self.assertEqual(self.updates[-1]['subtitle_qc_failed'], 0)
+        self.assertEqual(
+            self.updates[-1]['subtitle_qc_reason'],
+            'rule_fail:timeline_coverage_too_low',
+        )
+
+    def test_local_asr_qc_exception_is_advisory_and_continues(self):
+        result = self._run({
+            'SUBTITLE_QC_ENABLED': True,
+            'SPEECH_RECOGNITION_ENABLED': True,
+            'WHISPER_BASE_URL': 'http://[::1]:5052/v1',
+        }, run_side_effect=RuntimeError('boom'))
+        self.assertIs(result, True)
+        self.assertEqual(self.updates[-1]['subtitle_qc_failed'], 0)
+        self.assertEqual(
+            self.updates[-1]['subtitle_qc_reason'],
+            'advisory_local_asr:qc_unavailable',
+        )
 
     def test_strict_flag_is_forwarded(self):
         qc_result = MagicMock(passed=True, reason='ok', score=1.0, rule_score=1.0,

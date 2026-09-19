@@ -63,6 +63,7 @@ from .tag_presets import (
 )
 import subprocess
 from typing import Any, Dict
+from urllib.parse import urlparse
 from werkzeug.security import safe_join
 
 # 导入其他模块
@@ -845,6 +846,25 @@ def _is_asr_enabled(config: dict) -> bool:
     return _as_bool(config.get('SPEECH_RECOGNITION_ENABLED', False))
 
 
+def _is_local_speech_recognition(config: dict) -> bool:
+    """当前语音识别是否由本机回环地址提供。"""
+    if not _is_asr_enabled(config):
+        return False
+    provider = str(config.get('SPEECH_RECOGNITION_PROVIDER') or 'whisper').strip().lower()
+    if provider != 'whisper':
+        return False
+    base_url = (
+        config.get('WHISPER_BASE_URL')
+        or config.get('OPENAI_BASE_URL')
+        or ''
+    )
+    try:
+        hostname = (urlparse(str(base_url).strip()).hostname or '').strip().lower()
+    except Exception:
+        return False
+    return hostname in {'127.0.0.1', 'localhost', '::1'}
+
+
 def _subtitle_block_reasons(
     config: dict,
     quality_state,
@@ -883,7 +903,13 @@ def _subtitle_block_reasons(
     - ``SUBTITLE_QC_ENABLED=False``（``qc_enabled=False``）表示用户主动放弃
       质检这道防线：此时既不再看历史 ``qc_failed``，也不再要求 ``degraded``
       素材必须通过严格质检（否则「关掉质检」会变成「更严格」，与用户意图相反）。
+
+    本机回环地址上的 Whisper 属于用户明确选择的本地语音识别结果。质检仍会
+    执行并记录分数与原因，但不作为拒绝、隔离或阻断后续流程的依据。
     """
+    if _is_local_speech_recognition(config):
+        return []
+
     asr_blocks = _as_bool(config.get('ASR_FAILURE_BLOCKS_EMBED', True))
     if qc_enabled is None:
         qc_enabled = _as_bool(config.get('SUBTITLE_QC_ENABLED', True))
@@ -3760,15 +3786,27 @@ class TaskProcessor:
             if asr_generated:
                 asr_subtitle_path = subtitle_files[0] if subtitle_files else None
                 detected_lang = self._detect_subtitle_language(asr_subtitle_path) if asr_subtitle_path else None
+                local_asr_result = bool(
+                    _is_local_speech_recognition(self.config)
+                    and asr_subtitle_path
+                    and os.path.exists(asr_subtitle_path)
+                )
 
                 if embed_quality_state == 'failed':
-                    block_embed = _as_bool(self.config.get('ASR_FAILURE_BLOCKS_EMBED', True))
+                    block_embed = (
+                        _as_bool(self.config.get('ASR_FAILURE_BLOCKS_EMBED', True))
+                        and not local_asr_result
+                    )
                     log_fn = task_logger.error if block_embed else task_logger.warning
                     log_fn(
                         "ASR/VAD 质量结局为 failed（%s），%s：继续上传%s",
                         '/'.join(str(item) for item in (getattr(recognizer, 'last_degraded_reasons', []) or []))
                         or 'unknown',
-                        '拒绝烧录字幕' if block_embed else '按 ASR_FAILURE_BLOCKS_EMBED=False 放行烧录',
+                        '拒绝烧录字幕' if block_embed else (
+                            '本地语音识别结果按规则放行烧录'
+                            if local_asr_result
+                            else '按 ASR_FAILURE_BLOCKS_EMBED=False 放行烧录'
+                        ),
                         '原视频' if block_embed else '本次产物',
                     )
                     if block_embed:
@@ -4271,6 +4309,7 @@ class TaskProcessor:
         """
         enabled_raw = self.config.get('SUBTITLE_QC_ENABLED', True)
         enabled = _as_bool(enabled_raw)
+        local_asr_result = _is_local_speech_recognition(self.config)
         if not enabled:
             task_logger.info("字幕质检未启用，按配置跳过质检并放行烧录")
             return SUBTITLE_QC_DISABLED
@@ -4293,9 +4332,10 @@ class TaskProcessor:
                 strict=bool(strict),
             )
             checked_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            advisory_local_failure = local_asr_result and not result.passed
             update_task(
                 task_id,
-                subtitle_qc_failed=0 if result.passed else 1,
+                subtitle_qc_failed=0 if result.passed or advisory_local_failure else 1,
                 subtitle_qc_reason=result.reason,
                 subtitle_qc_score=float(result.score),
                 subtitle_qc_checked_at=checked_at,
@@ -4332,9 +4372,29 @@ class TaskProcessor:
                 result.sample_chars,
                 raw_ai.get('timeline_metrics') or 'n/a',
             )
+            if advisory_local_failure:
+                task_logger.warning(
+                    "本地语音识别字幕质检未通过，但按本地 ASR 放行规则继续后续流程"
+                )
+                return True
             return False
         except Exception as e:
-            # 质检执行异常不再默认放行：返回 None 表示「不可用」，由调用方拒绝烧录。
+            if local_asr_result:
+                try:
+                    task_logger.warning(
+                        "本地语音识别字幕质检执行异常，按本地 ASR 放行规则继续后续流程: %s",
+                        e,
+                    )
+                except Exception:
+                    pass
+                update_task(
+                    task_id,
+                    subtitle_qc_failed=0,
+                    subtitle_qc_reason='advisory_local_asr:qc_unavailable',
+                    subtitle_qc_checked_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                )
+                return True
+            # 非本地 ASR 的质检执行异常不默认放行。
             try:
                 task_logger.warning(f"字幕质检执行异常，判定为质检不可用，将不烧录字幕: {e}")
             except Exception:
@@ -9027,8 +9087,10 @@ class TaskProcessor:
                                 )
                                 task_logger.info(f"ASR 生成基础字幕成功: {os.path.basename(out_path)}")
 
-                                if quality_state == 'failed' and _as_bool(
-                                    self.config.get('ASR_FAILURE_BLOCKS_EMBED', True)
+                                if (
+                                    quality_state == 'failed'
+                                    and _as_bool(self.config.get('ASR_FAILURE_BLOCKS_EMBED', True))
+                                    and not _is_local_speech_recognition(self.config)
                                 ):
                                     task_logger.error(
                                         "上传前 ASR 质量结局为 failed，拒绝烧录字幕并继续上传原视频"
