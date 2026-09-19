@@ -405,8 +405,15 @@ def _is_natural_description(text: str, max_blocks: Optional[int] = 2) -> bool:
         return False
     if '►' in text:
         return False
-    if any(len(block.strip()) < 6 for block in blocks):
-        return False
+    # A concise closing sentence is valid prose. Counting punctuation in a
+    # fixed six-character threshold rejected natural Chinese endings such as
+    # "生活美好。" (five code points), causing every otherwise valid
+    # translation to be discarded. Keep rejecting empty/trivial fragments,
+    # but measure meaningful letters/digits and allow four-character clauses.
+    for block in blocks:
+        meaningful_length = sum(len(token) for token in _MEANINGFUL_TEXT_RE.findall(block))
+        if meaningful_length < 4:
+            return False
     return True
 
 def _validate_output(
