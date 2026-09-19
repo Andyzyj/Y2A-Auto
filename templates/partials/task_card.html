@@ -125,19 +125,25 @@
                     {% set subtitle_w = task.subtitle_warning_message|trim %}
                     {% if subtitle_w == 'subtitle_embed_failed' %}
                         {% set subtitle_w_tip = '字幕烧录失败，已保留字幕文件并继续上传原视频' %}
+                        {% set subtitle_w_badge = '字幕烧录异常' %}
                     {% elif subtitle_w == 'asr_failed_block_embed' %}
                         {% set subtitle_w_tip = 'ASR/VAD 质量结局为 failed（来源不可信），已拒绝烧录字幕并继续上传原视频' %}
+                        {% set subtitle_w_badge = '字幕已跳过' %}
                     {% elif subtitle_w == 'asr_degraded_block_embed' %}
                         {% set subtitle_w_tip = 'ASR/VAD 质量结局为 degraded 且未通过严格质检，已拒绝烧录字幕' %}
+                        {% set subtitle_w_badge = '字幕已跳过' %}
                     {% elif subtitle_w == 'subtitle_qc_rejected' %}
                         {% set subtitle_w_tip = '字幕质检未通过，已拒绝烧录并保留字幕文件供人工检查' %}
+                        {% set subtitle_w_badge = '字幕质检未通过' %}
                     {% elif subtitle_w == 'qc_unavailable' %}
                         {% set subtitle_w_tip = '字幕质检未执行（文件缺失或执行异常），已按拒绝处理，可关闭字幕质检开关放行' %}
+                        {% set subtitle_w_badge = '字幕质检异常' %}
                     {% else %}
                         {% set subtitle_w_tip = '字幕处理警告: ' ~ subtitle_w %}
+                        {% set subtitle_w_badge = '字幕处理警告' %}
                     {% endif %}
                     <div class="mt-1">
-                        <span class="badge bg-warning text-dark" title="{{ subtitle_w_tip }}" data-bs-toggle="tooltip" data-bs-placement="top">字幕烧录异常</span>
+                        <span class="badge bg-warning text-dark" title="{{ subtitle_w_tip }}" data-bs-toggle="tooltip" data-bs-placement="top">{{ subtitle_w_badge }}</span>
                     </div>
                 {% endif %}
             </div>
