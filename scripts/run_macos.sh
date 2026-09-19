@@ -9,7 +9,12 @@ if [[ ! -x .venv/bin/python ]]; then
   exit 1
 fi
 
-export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+ffmpeg7_dir="/opt/homebrew/opt/ffmpeg@7/bin"
+if [[ -x "$ffmpeg7_dir/ffmpeg" ]]; then
+  export PATH="$ffmpeg7_dir:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+else
+  export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+fi
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-5051}"
 export PYTHONUNBUFFERED=1
