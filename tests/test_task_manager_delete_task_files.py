@@ -71,9 +71,12 @@ class DeleteTaskFilesTests(unittest.TestCase):
 
     def test_delete_task_files_removes_existing_task_directory(self):
         task_dir = os.path.join(self.downloads_dir, self.TASK_ID)
-        os.makedirs(task_dir, exist_ok=True)
+        whisper_dir = os.path.join(task_dir, 'whisper', 'chunks')
+        os.makedirs(whisper_dir, exist_ok=True)
         with open(os.path.join(task_dir, 'metadata.json'), 'w', encoding='utf-8') as fh:
             fh.write('{}')
+        with open(os.path.join(whisper_dir, 'clip_0001.wav'), 'wb') as fh:
+            fh.write(b'whisper artifact')
 
         result = self.delete_task_files(self.TASK_ID)
 

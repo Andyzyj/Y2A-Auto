@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import tempfile
 import wave
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .asr_api_client import AsrApiClient, AsrConfig
@@ -191,6 +193,8 @@ class SpeechRecognizer:
         self.last_quality_state: str = 'ok'
         self.last_degraded_reasons: List[str] = []
         self._temp_dirs: List[str] = []
+        self._artifact_dir: Optional[str] = None
+        self._clip_counter: int = 0
         # 本轮 VAD 命中的实际语音区间。幻觉清洗需要它判定「该 cue 落在静音段」，
         # 否则静音段重复检测在生产路径上恒不触发。
         self._last_vad_spans: Tuple[Tuple[float, float], ...] = ()
@@ -280,6 +284,7 @@ class SpeechRecognizer:
             self.last_quality_state = 'ok'
             self.last_degraded_reasons = []
             self._last_vad_spans = ()
+            self._prepare_artifact_dir(output_path)
 
             if not self._asr.client:
                 self.last_error_message = 'ASR client not initialised'
@@ -336,7 +341,54 @@ class SpeechRecognizer:
             return None
         finally:
             self._resolve_quality_state(output_path)
+            self._write_artifact_manifest(video_path, output_path)
             self._cleanup_temp_files()
+
+    def _prepare_artifact_dir(self, output_path: str) -> None:
+        """Keep Whisper working files beside the task's downloaded video.
+
+        ``output_path`` is created by task_manager inside downloads/<task-id>.
+        Placing every ASR artifact beneath that directory makes all existing
+        cleanup paths (manual, scheduled, per-task and post-upload) remove them
+        together with the downloaded video.
+        """
+        task_dir = os.path.dirname(os.path.abspath(output_path))
+        self._artifact_dir = os.path.join(task_dir, 'whisper')
+        Path(self._artifact_dir, 'chunks').mkdir(parents=True, exist_ok=True)
+        self._clip_counter = 0
+
+    def _write_artifact_manifest(self, video_path: str, output_path: str) -> None:
+        if not self._artifact_dir:
+            return
+        try:
+            task_dir = os.path.dirname(self._artifact_dir)
+            artifacts: List[Dict[str, Any]] = []
+            for root, _, files in os.walk(self._artifact_dir):
+                for filename in sorted(files):
+                    path = os.path.join(root, filename)
+                    if os.path.basename(path) == 'manifest.json':
+                        continue
+                    artifacts.append({
+                        'path': os.path.relpath(path, task_dir),
+                        'bytes': os.path.getsize(path),
+                    })
+            payload = {
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'provider': self.config.api_provider,
+                'model': self.config.model_name,
+                'source_video': os.path.relpath(os.path.abspath(video_path), task_dir),
+                'subtitle_output': os.path.relpath(os.path.abspath(output_path), task_dir),
+                'quality_state': self.last_quality_state,
+                'quality_reasons': list(self.last_degraded_reasons),
+                'warning': self.last_warning_message,
+                'error': self.last_error_message,
+                'artifacts': artifacts,
+                'cleanup_scope': 'task_download_directory',
+            }
+            with open(os.path.join(self._artifact_dir, 'manifest.json'), 'w', encoding='utf-8') as file_obj:
+                json.dump(payload, file_obj, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.logger.warning('Failed to write Whisper artifact manifest: %s', exc)
 
     def _resolve_quality_state(self, output_path: Optional[str]) -> None:
         """按实际产出与警告 token 裁决本次转录的质量结局。
@@ -674,9 +726,12 @@ class SpeechRecognizer:
     def _extract_audio_wav(self, video_path: str) -> Optional[str]:
         try:
             ffmpeg_bin = get_ffmpeg_path(logger=self.logger) or 'ffmpeg'
-            out_dir = tempfile.mkdtemp(prefix='y2a_audio_')
-            self._temp_dirs.append(out_dir)
-            audio_path = os.path.join(out_dir, 'audio.wav')
+            if self._artifact_dir:
+                out_dir = self._artifact_dir
+            else:
+                out_dir = tempfile.mkdtemp(prefix='y2a_audio_')
+                self._temp_dirs.append(out_dir)
+            audio_path = os.path.join(out_dir, 'source_audio.wav')
             cmd = [
                 ffmpeg_bin, '-y', '-i', video_path,
                 '-vn', '-ac', '1', '-ar', '16000',
@@ -701,9 +756,18 @@ class SpeechRecognizer:
     def _extract_audio_clip(self, wav_path: str, start_s: float, end_s: float) -> Optional[str]:
         try:
             ffmpeg_bin = get_ffmpeg_path(logger=self.logger) or 'ffmpeg'
-            out_dir = tempfile.mkdtemp(prefix='y2a_clip_')
-            self._temp_dirs.append(out_dir)
-            out_wav = os.path.join(out_dir, 'clip.wav')
+            if self._artifact_dir:
+                out_dir = os.path.join(self._artifact_dir, 'chunks')
+                os.makedirs(out_dir, exist_ok=True)
+                self._clip_counter += 1
+                out_wav = os.path.join(
+                    out_dir,
+                    f'clip_{self._clip_counter:04d}_{start_s:.3f}_{end_s:.3f}.wav',
+                )
+            else:
+                out_dir = tempfile.mkdtemp(prefix='y2a_clip_')
+                self._temp_dirs.append(out_dir)
+                out_wav = os.path.join(out_dir, 'clip.wav')
             duration = max(0.01, float(end_s) - float(start_s))
             cmd = [
                 ffmpeg_bin, '-y',
