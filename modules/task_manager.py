@@ -3013,7 +3013,8 @@ class TaskProcessor:
                     if ok:
                         completed_stages = _mark_stage_done(task_id, completed_stages, PIPELINE_STAGE_TRANSLATE_SUBTITLE)
                     if task is not None and task['status'] == TASK_STATES['FAILED']:
-                        task_logger.error("字幕处理失败，继续执行后续步骤")
+                        task_logger.error("字幕处理失败，终止任务，避免上传未完成字幕处理的视频")
+                        return
                 _raise_if_cancelled(task_id, task_logger)
 
             # 6. 上传
@@ -4429,6 +4430,81 @@ class TaskProcessor:
     def _detect_subtitle_language(self, subtitle_path):
         """从字幕文件名提取语言代码（如 video.ja.srt -> ja）"""
         return _subtitle_language_tag(subtitle_path)
+
+    _HDR_TRANSFER_VALUES = frozenset({'arib-std-b67', 'smpte2084'})
+    _HDR_10BIT_PIXEL_FORMATS = frozenset({
+        'p010le', 'p010be', 'yuv420p10le', 'yuv420p10be',
+        'yuv422p10le', 'yuv422p10be', 'yuv444p10le', 'yuv444p10be',
+    })
+
+    @classmethod
+    def _is_hdr_stream_info(cls, stream_info) -> bool:
+        """按传递函数识别 HDR10(PQ) / HLG 输入。"""
+        if not isinstance(stream_info, dict):
+            return False
+        transfer = str(stream_info.get('color_transfer') or '').strip().lower()
+        return transfer in cls._HDR_TRANSFER_VALUES
+
+    @classmethod
+    def _hdr_output_validation_error(cls, stream_info) -> str:
+        """返回 HDR 输出不合格原因；空字符串表示仍为可投稿的 10-bit HDR。"""
+        if not isinstance(stream_info, dict):
+            return '无法读取输出视频流信息'
+        codec = str(stream_info.get('codec_name') or '').strip().lower()
+        profile = str(stream_info.get('profile') or '').replace(' ', '').strip().lower()
+        tag = str(stream_info.get('codec_tag_string') or '').strip().lower()
+        pix_fmt = str(stream_info.get('pix_fmt') or '').strip().lower()
+        primaries = str(stream_info.get('color_primaries') or '').strip().lower()
+        transfer = str(stream_info.get('color_transfer') or '').strip().lower()
+        colorspace = str(stream_info.get('color_space') or '').strip().lower()
+        if codec not in {'hevc', 'h265'}:
+            return f'输出编码不是 HEVC: {codec or "unknown"}'
+        if profile != 'main10':
+            return f'输出档位不是 Main 10: {profile or "unknown"}'
+        if tag != 'hvc1':
+            return f'输出 HEVC 标签不是 hvc1: {tag or "unknown"}'
+        if pix_fmt not in cls._HDR_10BIT_PIXEL_FORMATS and '10' not in pix_fmt:
+            return f'输出不是 10-bit 像素格式: {pix_fmt or "unknown"}'
+        if primaries != 'bt2020':
+            return f'输出色域不是 BT.2020: {primaries or "unknown"}'
+        if transfer not in cls._HDR_TRANSFER_VALUES:
+            return f'输出传递函数不是 HLG/PQ: {transfer or "unknown"}'
+        if colorspace not in {'bt2020nc', 'bt2020c'}:
+            return f'输出矩阵不是 BT.2020: {colorspace or "unknown"}'
+        return ''
+
+    @staticmethod
+    def _force_main10_x265_params(params):
+        """把内部 x265 参数升级为 Main10；HDR 路径不允许落回 8-bit。"""
+        result = list(params or [])
+        for option, value in (
+            ('-profile:v', 'main10'),
+            ('-pix_fmt', 'yuv420p10le'),
+            ('-tag:v', 'hvc1'),
+        ):
+            try:
+                index = result.index(option)
+            except ValueError:
+                result.extend([option, value])
+            else:
+                if index + 1 < len(result):
+                    result[index + 1] = value
+                else:
+                    result.append(value)
+        return result
+
+    @staticmethod
+    def _build_apple_hdr_params(gop_hevc):
+        """Apple Silicon / Intel Mac 的自动 HEVC Main10 硬编参数。"""
+        return [
+            '-c:v', 'hevc_videotoolbox',
+            '-profile:v', 'main10',
+            '-q:v', '65',
+            '-fps_mode', 'cfr',
+            '-g', str(max(1, int(gop_hevc or 240))),
+            '-pix_fmt', 'p010le',
+            '-tag:v', 'hvc1',
+        ]
     
     _KNOWN_HW_ENCODER_ERROR_PATTERNS = (
         # 软件编码器：libx265 不一定被编进用户的 FFmpeg（自备构建常见
@@ -4786,6 +4862,16 @@ class TaskProcessor:
                 '-rc:v', 'vbr',
                 '-cq:v', '23',
                 '-profile:v', 'main',
+            ])
+        elif encoder_name_lower == 'hevc_videotoolbox':
+            test_cmd.extend([
+                '-f', 'lavfi', '-i', color_src,
+                '-vf', 'format=p010le',
+                '-frames:v', '1',
+                '-c:v', encoder_name,
+                '-profile:v', 'main10',
+                '-q:v', '65',
+                '-pix_fmt', 'p010le',
             ])
         elif 'nvenc' in encoder_name_lower:
             test_cmd.extend([
@@ -7270,6 +7356,7 @@ class TaskProcessor:
             input_video_codec = str(stream_info.get('codec_name') or '').strip().lower()
             input_video_bit_rate = self._coerce_int(stream_info.get('bit_rate'))
             input_pix_fmt = stream_info.get('pix_fmt') if isinstance(stream_info, dict) else None
+            hdr_input = self._is_hdr_stream_info(stream_info)
             input_size_bytes = os.path.getsize(video_path) if os.path.exists(video_path) else None
             # 探测音频信息（用于跟随原视频）
             audio_info = self._get_audio_stream_info(video_path, task_logger)
@@ -7288,6 +7375,15 @@ class TaskProcessor:
                 _format_size_for_log(input_size_bytes),
             )
             task_logger.info(f"GOP 设置: H.264={gop} (2秒), HEVC={gop_hevc} (4秒)")
+            if hdr_input:
+                task_logger.info(
+                    "检测到 HDR 源视频：transfer=%s, primaries=%s, colorspace=%s, pix_fmt=%s；"
+                    "将自动使用 HEVC Main10 烧录字幕并在上传前验证 HDR 输出",
+                    stream_info.get('color_transfer') or 'unknown',
+                    stream_info.get('color_primaries') or 'unknown',
+                    stream_info.get('color_space') or 'unknown',
+                    input_pix_fmt or 'unknown',
+                )
 
             def _ffmpeg_has_filter(filter_name: str) -> bool:
                 try:
@@ -7561,6 +7657,12 @@ class TaskProcessor:
                 # CPU 软编码器（x264 / x265）。与 VIDEO_ENCODER 正交：后者选硬件，
                 # 这里选软编码实现。x265 输出 HEVC，实测编码耗时约为 x264 的 5 倍。
                 cpu_codec = normalize_cpu_codec(encoder_settings.get('cpu_codec'))
+                if hdr_input:
+                    # HDR 自动路径必须接管 codec/profile/pix_fmt，不能让 SDR 偏好或
+                    # 自定义 8-bit 参数生成只有标签、没有真实动态范围的伪 HDR。
+                    cpu_codec = 'x265'
+                    if custom_video_params:
+                        task_logger.warning("HDR 自动编码已忽略自定义视频参数，以确保 Main10 输出")
 
                 # tune 是按 CPU 编码器各自的白名单校验的：film / stillimage 在 x264
                 # 下合法，在 x265 下会让编码直接失败。用户切到 x265 后这类取值会被
@@ -7597,12 +7699,13 @@ class TaskProcessor:
                 color_params = []
                 color_map = {}
                 try:
+                    color_mode = 'auto' if hdr_input else encoder_settings.get('color_metadata_mode')
                     color_map = normalize_color_metadata(
-                        encoder_settings.get('color_metadata_mode'),
+                        color_mode,
                         stream_info,
                     )
                     color_params = resolve_color_metadata(
-                        encoder_settings.get('color_metadata_mode'),
+                        color_mode,
                         stream_info,
                         logger=task_logger,
                     )
@@ -7641,10 +7744,10 @@ class TaskProcessor:
                             else hw_quality_boost
                         ),
                         'hw_quality_level': encoder_settings.get('hw_quality_level'),
-                        'cpu_codec': cpu_codec_override or encoder_settings.get('cpu_codec'),
+                        'cpu_codec': cpu_codec_override or cpu_codec,
                         'software_tune': encoder_settings.get('software_tune'),
                         'color_map': color_map,
-                        'custom_params': custom_video_params,
+                        'custom_params': None if hdr_input else custom_video_params,
                     }
                     if amd_backend is not None:
                         ctx['amd_backend'] = amd_backend
@@ -7654,13 +7757,17 @@ class TaskProcessor:
                 # 色彩 VUI 已由 build_encoder_params 合并在内，调用方不要再另行追加，
                 # 否则 x265 会出现两条 -x265-params 而后者覆盖前者。
                 def build_cpu_params(cpu_codec_override=None, hw_quality_boost=None):
-                    return build_encoder_params(
+                    params = build_encoder_params(
                         'cpu',
                         _video_param_ctx(
-                            cpu_codec_override=cpu_codec_override,
+                            cpu_codec_override=(cpu_codec_override or ('x265' if hdr_input else None)),
                             hw_quality_boost=hw_quality_boost,
                         ),
                     )
+                    return self._force_main10_x265_params(params) if hdr_input else params
+
+                def build_apple_hdr_params():
+                    return self._build_apple_hdr_params(gop_hevc)
 
                 def build_nvidia_params(hw_quality_boost=None):
                     """生成 NVIDIA NVENC HEVC 编码参数"""
@@ -7688,8 +7795,18 @@ class TaskProcessor:
                 # 确定使用的编码器
                 encoder_pref = str(self.config.get('VIDEO_ENCODER', 'auto')).lower().strip()
                 actual_encoder = encoder_pref
-                
-                if encoder_pref == 'auto':
+
+                if hdr_input:
+                    if sys.platform == 'darwin' and _detect_hw_encoder('hevc_videotoolbox'):
+                        actual_encoder = 'apple'
+                    else:
+                        actual_encoder = 'cpu'
+                    task_logger.info(
+                        "HDR 自动编码器选择: %s",
+                        'Apple VideoToolbox HEVC Main10' if actual_encoder == 'apple'
+                        else 'CPU libx265 Main10',
+                    )
+                elif encoder_pref == 'auto':
                     actual_encoder = _get_best_encoder()
                 elif encoder_pref == 'nvidia':
                     if not _detect_nvidia():
@@ -7741,7 +7858,10 @@ class TaskProcessor:
                         actual_encoder = _get_best_encoder()
 
                 # 根据编码器生成参数
-                if actual_encoder == 'nvidia':
+                if actual_encoder == 'apple':
+                    vparams = build_apple_hdr_params()
+                    task_logger.info("使用 Apple VideoToolbox HEVC Main10 硬件编码")
+                elif actual_encoder == 'nvidia':
                     vparams = build_nvidia_params()
                     task_logger.info("使用 NVIDIA NVENC HEVC 硬件编码")
                 elif actual_encoder == 'intel':
@@ -7777,7 +7897,7 @@ class TaskProcessor:
                 # **另一个**编码器写了私有参数时（切换 VIDEO_CPU_CODEC 后忘了删旧参数），
                 # 扫到的第一条 -x26?-params 不是我们写的那条，日志会按错误的编码器口径
                 # 说反（R5-1）。
-                if custom_video_params:
+                if custom_video_params and not hdr_input:
                     _vui_option, _vui_codec, _vui_reason = custom_params_vui_report(
                         custom_video_params, cpu_codec, color_map
                     )
@@ -7829,7 +7949,15 @@ class TaskProcessor:
 
                 # 构建视频滤镜链
                 # VAAPI 编码器需要特殊处理：在字幕滤镜后添加格式转换和硬件上传
-                if is_vaapi_encoder():
+                if hdr_input and actual_encoder == 'apple':
+                    # VideoToolbox Main10 接受 p010le；显式转换可避免字幕滤镜
+                    # 输出 8-bit yuv420p 后由编码器静默降级为 Main profile。
+                    final_vf = f"{vf_filter},format=p010le"
+                elif hdr_input:
+                    # libass 会按输入格式协商输出；HDR 软件编码必须在滤镜链末端
+                    # 拉回 10-bit，确保 libx265 实际生成 Main10 码流。
+                    final_vf = f"{vf_filter},format=yuv420p10le"
+                elif is_vaapi_encoder():
                     # VAAPI: subtitles -> format=nv12 -> hwupload
                     final_vf = f"{vf_filter},format=nv12,hwupload"
                 else:
@@ -8010,6 +8138,22 @@ class TaskProcessor:
                     cmd, first_stage_budget
                 )
 
+                if process_returncode == 0 and output_ready and hdr_input:
+                    hdr_validation_error = self._hdr_output_validation_error(
+                        self._get_video_stream_info(simple_output, task_logger)
+                    )
+                    if hdr_validation_error:
+                        task_logger.error(
+                            "HDR 成片校验失败（%s），不会把该文件交给上传器",
+                            hdr_validation_error,
+                        )
+                        error_output_full = (
+                            f"{error_output_full}\nHDR output validation failed: "
+                            f"{hdr_validation_error}"
+                        ).strip()
+                        process_returncode = -1
+                        output_ready = False
+
                 if process_returncode == 0 and output_ready:
                     # 成功：优先原子替换，避免重复复制大文件
                     self._finalize_embedded_video_output(simple_output, embedded_video_path)
@@ -8086,13 +8230,18 @@ class TaskProcessor:
                             f"硬件编码器 {actual_encoder} 失败（返回码: {process_returncode}），"
                             f"未检测到已知硬件错误，仍尝试降级重试"
                         )
-                retry_stages = self._resolve_embed_retry_stages(
-                    actual_encoder,
-                    encoder_settings.get('hw_quality_boost'),
-                    hw_error_detected,
-                    hw_option_error,
-                    cpu_codec,
-                )
+                if hdr_input:
+                    # HDR 只能从 VideoToolbox Main10 回退到 libx265 Main10；
+                    # 任何 x264/8-bit 降级都会把 HDR 变成伪 HDR，因此禁止。
+                    retry_stages = ['cpu'] if actual_encoder == 'apple' else []
+                else:
+                    retry_stages = self._resolve_embed_retry_stages(
+                        actual_encoder,
+                        encoder_settings.get('hw_quality_boost'),
+                        hw_error_detected,
+                        hw_option_error,
+                        cpu_codec,
+                    )
                 if first_timed_out:
                     retry_stages = self._drop_same_encoder_stage_after_timeout(retry_stages)
 
@@ -8152,13 +8301,17 @@ class TaskProcessor:
                             "libx265 不可用或其参数不被接受，改用 libx264 软编码重试..."
                         )
                         stage_vparams = build_cpu_params(cpu_codec_override='x264')
-                        stage_filter = vf_filter
+                        stage_filter = (
+                            f"{vf_filter},format=yuv420p10le" if hdr_input else vf_filter
+                        )
                         stage_color_params = list(color_params)
                     else:
                         stage_label = 'CPU 软编码'
                         task_logger.warning("尝试使用CPU编码回退方案...")
                         stage_vparams = build_cpu_params()
-                        stage_filter = vf_filter
+                        stage_filter = (
+                            f"{vf_filter},format=yuv420p10le" if hdr_input else vf_filter
+                        )
                         stage_color_params = list(color_params)
 
                     # 每个阶段只拿「总预算减去已用掉的部分」，且单阶段不得超过**该
@@ -8182,6 +8335,22 @@ class TaskProcessor:
                     retry_returncode, retry_error, retry_ready, _stage_timed_out = _execute_embed(
                         cmd_retry, stage_timeout, stage_label
                     )
+                    if retry_returncode == 0 and retry_ready and hdr_input:
+                        hdr_validation_error = self._hdr_output_validation_error(
+                            self._get_video_stream_info(simple_output, task_logger)
+                        )
+                        if hdr_validation_error:
+                            task_logger.error(
+                                "HDR 回退成片校验失败（%s），不会把该文件交给上传器",
+                                hdr_validation_error,
+                            )
+                            retry_error = (
+                                f"{retry_error}\nHDR output validation failed: "
+                                f"{hdr_validation_error}"
+                            ).strip()
+                            retry_returncode = -1
+                            retry_ready = False
+
                     if retry_returncode == 0 and retry_ready:
                         self._finalize_embedded_video_output(simple_output, embedded_video_path)
                         _log_output_media_summary(embedded_video_path)
@@ -8200,6 +8369,19 @@ class TaskProcessor:
                     except Exception as cleanup_exc:
                         task_logger.warning(f"清理回退残留输出失败: {cleanup_exc}")
 
+                if hdr_input:
+                    error_message = (
+                        "HDR 视频字幕编码失败：未生成通过 Main10、BT.2020 和 HLG/PQ "
+                        "校验的成片，已停止上传"
+                    )
+                    task_logger.error(error_message)
+                    update_task(
+                        task_id,
+                        upload_progress=None,
+                        status=TASK_STATES['FAILED'],
+                        error_message=error_message,
+                    )
+                    return None
                 update_task(task_id, upload_progress=None, status=previous_status, silent=True)
                 return None
             
@@ -8276,6 +8458,8 @@ class TaskProcessor:
             "fps": None,
             "pix_fmt": None,
             "codec_name": None,
+            "profile": None,
+            "codec_tag_string": None,
             "bit_rate": None,
             # 色彩元数据：转码时透传，避免播放器按默认色域解释导致偏色
             "color_space": None,
@@ -8314,6 +8498,8 @@ class TaskProcessor:
                         info['height'] = s.get('height')
                         info['pix_fmt'] = s.get('pix_fmt')
                         info['codec_name'] = s.get('codec_name')
+                        info['profile'] = s.get('profile')
+                        info['codec_tag_string'] = s.get('codec_tag_string')
                         info['color_space'] = s.get('color_space')
                         info['color_primaries'] = s.get('color_primaries')
                         info['color_transfer'] = s.get('color_transfer')
@@ -9427,6 +9613,9 @@ class TaskProcessor:
         if not subtitle_prepared:
             task = self._prepare_subtitle_for_upload(task_id, task_logger) or task
             video_path = task.get('video_path_local', '') if task else video_path
+            if task and task.get('status') == TASK_STATES['FAILED']:
+                task_logger.error("上传前字幕处理失败，已停止 AcFun 上传")
+                return
 
         # 重新设置状态为上传中（字幕翻译可能已在上述步骤执行）
         update_task(task_id, status=TASK_STATES['UPLOADING'])
@@ -9667,6 +9856,9 @@ class TaskProcessor:
         if not subtitle_prepared:
             task = self._prepare_subtitle_for_upload(task_id, task_logger) or task
             video_path = task.get('video_path_local', '') if task else video_path
+            if task and task.get('status') == TASK_STATES['FAILED']:
+                task_logger.error("上传前字幕处理失败，已停止 bilibili 上传")
+                return
 
         update_task(task_id, status=TASK_STATES['UPLOADING'], upload_progress='0.0%')
 

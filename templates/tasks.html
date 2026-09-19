@@ -164,6 +164,12 @@
                         </select>
                         <div class="form-text">不选择时将使用系统默认平台</div>
                     </div>
+                    <div class="alert alert-info py-2 mb-0 d-none" id="hdrAutoNotice" role="status">
+                        <i class="bi bi-badge-hd"></i>
+                        提交后会自动检测实际下载的视频。若为 HDR，平台将使用 HEVC Main10
+                        保留 BT.2020 与 HLG/PQ 色彩信息烧录字幕，校验通过后再上传至 bilibili；
+                        无需人工确认。
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
@@ -1172,6 +1178,18 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     }
 
     document.addEventListener('DOMContentLoaded', function() {
+        const uploadTarget = document.getElementById('upload_target');
+        const hdrAutoNotice = document.getElementById('hdrAutoNotice');
+        const updateHdrAutoNotice = function() {
+            if (!uploadTarget || !hdrAutoNotice) return;
+            const supportsBilibili = uploadTarget.value === 'bilibili' || uploadTarget.value === 'both';
+            hdrAutoNotice.classList.toggle('d-none', !supportsBilibili);
+        };
+        if (uploadTarget) {
+            uploadTarget.addEventListener('change', updateHdrAutoNotice);
+            updateHdrAutoNotice();
+        }
+
         // 监听交互，减少实时刷新带来的 hover 闪烁/误点
         const tasksRoot = document.querySelector('#tasksContent');
         if (tasksRoot) {
@@ -1209,5 +1227,4 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     });
 </script>
 {% endblock %} 
-
 
