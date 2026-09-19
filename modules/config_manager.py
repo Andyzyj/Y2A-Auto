@@ -4,6 +4,9 @@
 import os
 import json
 import logging
+import shutil
+import tempfile
+import time
 from copy import deepcopy
 from .utils import get_app_subdir
 from .speech_pipeline_settings import (
@@ -467,30 +470,51 @@ def load_config():
     return default_config
 
 def save_config(config, config_path=None):
-    """
-    保存配置到文件
-    
-    Args:
-        config (dict): 配置字典
-        config_path (str, optional): 配置文件路径，如果不提供则使用默认路径
-    
-    Returns:
-        bool: 保存是否成功
-    """
+    """安全保存配置，并在覆盖前保留旧版本。"""
     if not config_path:
         config_path = os.path.join(get_app_subdir('config'), 'config.json')
-    
-    # 确保config目录存在
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    
+
+    config_dir = os.path.dirname(config_path)
+    os.makedirs(config_dir, exist_ok=True)
+    temp_path = None
+
     try:
-        with open(config_path, 'w', encoding='utf-8') as f:
+        # 先在同一目录完整写入临时文件，再原子替换。进程中断时不会留下
+        # 被截断的 config.json。
+        fd, temp_path = tempfile.mkstemp(
+            prefix='.config.', suffix='.tmp', dir=config_dir
+        )
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
-        logger.info("配置已保存到文件")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, 0o600)
+
+        # 每次覆盖有效旧配置前创建带时间戳的恢复点。配置目录已被
+        # .gitignore 排除，备份不会进入 Git；权限与主配置同为仅用户可读。
+        if os.path.exists(config_path) and os.path.getsize(config_path) > 2:
+            backup_dir = os.path.join(config_dir, 'backups')
+            os.makedirs(backup_dir, exist_ok=True)
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            backup_name = f"config.{stamp}-{time.time_ns()}.json"
+            backup_path = os.path.join(backup_dir, backup_name)
+            shutil.copy2(config_path, backup_path)
+            os.chmod(backup_path, 0o600)
+
+        os.replace(temp_path, config_path)
+        temp_path = None
+        os.chmod(config_path, 0o600)
+        logger.info("配置已原子保存到文件，并保留旧配置备份")
         return True
     except Exception as e:
         logger.error(f"保存配置文件时出错: {str(e)}")
         return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 def update_config(new_config):
     """
