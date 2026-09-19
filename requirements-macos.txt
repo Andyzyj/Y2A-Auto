@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# silero-vad 6.2.x imports its ONNX sequence runtime on macOS, but does not
+# install this optional dependency itself. The native arm64 wheel is available.
+onnxruntime>=1.23,<2

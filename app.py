@@ -4353,10 +4353,12 @@ if __name__ == '__main__':
     download_cleanup_scheduler = schedule_download_cleanup()
 
     try:
+        host = os.environ.get('HOST', '0.0.0.0').strip() or '0.0.0.0'
         port = int(os.environ.get('PORT', 5000))
-        logger.info(f"服务启动，监听地址: http://127.0.0.1:{port}")
+        display_host = '127.0.0.1' if host in ('0.0.0.0', '::') else host
+        logger.info(f"服务启动，监听地址: http://{display_host}:{port}（绑定 {host}）")
         # 使用标准Flask运行
-        app.run(host='0.0.0.0', port=port, debug=False)
+        app.run(host=host, port=port, debug=False)
     except KeyboardInterrupt:
         logger.info("接收到退出信号，服务正在关闭...")
     except Exception as e:
