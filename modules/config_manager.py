@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import tempfile
+import threading
 import time
 from copy import deepcopy
 from .utils import get_app_subdir
@@ -18,6 +19,10 @@ from .prompt_manager import get_default_config_entries as _get_prompt_default_en
 
 # 获取日志记录器
 logger = logging.getLogger('config_manager')
+
+# Settings are saved from a background thread. Keep the whole read-modify-write
+# transaction serialized so two close saves cannot overwrite each other's data.
+_CONFIG_IO_LOCK = threading.RLock()
 
 _YOUTUBE_DOWNLOAD_QUALITY_MODES = ('highest', 'manual')
 _YOUTUBE_DOWNLOAD_MAX_HEIGHT_VALUES = ('2160', '1440', '1080', '720', '480', '360')
@@ -352,6 +357,8 @@ def load_config():
         if os.path.exists(config_path) and os.path.getsize(config_path) > 2:  # 文件存在且不为空
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+                if not isinstance(config, dict):
+                    raise ValueError("配置文件根节点必须是 JSON 对象")
                 logger.info("成功加载配置文件")
 
                 config, migrated_legacy_speech = migrate_legacy_speech_pipeline_config(config)
@@ -458,8 +465,37 @@ def load_config():
                         logger.info("已清理过期配置项: %s", ', '.join(sorted(removed_keys)))
                     save_config(config, config_path)
                 return config
-    except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+    except (json.JSONDecodeError, FileNotFoundError, PermissionError, ValueError) as e:
         logger.warning(f"读取配置文件时出错: {str(e)}")
+
+        # An existing but unreadable config must never be replaced with defaults.
+        # Recover the newest valid automatic backup; if none exists, fail loudly
+        # and preserve the damaged file for manual recovery.
+        if os.path.exists(config_path):
+            backup_dir = os.path.join(os.path.dirname(config_path), 'backups')
+            if os.path.isdir(backup_dir):
+                for backup_path in sorted(
+                    (
+                        os.path.join(backup_dir, name)
+                        for name in os.listdir(backup_dir)
+                        if name.startswith('config.') and name.endswith('.json')
+                        and '.corrupt.' not in name
+                    ),
+                    reverse=True,
+                ):
+                    try:
+                        with open(backup_path, 'r', encoding='utf-8') as backup_file:
+                            recovered = json.load(backup_file)
+                        if not isinstance(recovered, dict):
+                            continue
+                        if save_config(recovered, config_path):
+                            logger.warning("已从最近有效备份恢复配置: %s", backup_path)
+                            return load_config()
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
+            raise RuntimeError(
+                "配置文件无法读取，且没有可用备份；已保留原文件，拒绝用默认配置覆盖"
+            ) from e
     
     # 如果配置文件不存在或读取失败，创建默认配置
     logger.info("使用默认配置并创建配置文件")
@@ -469,7 +505,7 @@ def load_config():
     save_config(default_config, config_path)
     return default_config
 
-def save_config(config, config_path=None):
+def _save_config_unlocked(config, config_path=None):
     """安全保存配置，并在覆盖前保留旧版本。"""
     if not config_path:
         config_path = os.path.join(get_app_subdir('config'), 'config.json')
@@ -492,7 +528,15 @@ def save_config(config, config_path=None):
 
         # 每次覆盖有效旧配置前创建带时间戳的恢复点。配置目录已被
         # .gitignore 排除，备份不会进入 Git；权限与主配置同为仅用户可读。
+        current_is_valid = False
         if os.path.exists(config_path) and os.path.getsize(config_path) > 2:
+            try:
+                with open(config_path, 'r', encoding='utf-8') as current_file:
+                    current_is_valid = isinstance(json.load(current_file), dict)
+            except (OSError, ValueError, json.JSONDecodeError):
+                current_is_valid = False
+
+        if current_is_valid:
             backup_dir = os.path.join(config_dir, 'backups')
             os.makedirs(backup_dir, exist_ok=True)
             stamp = time.strftime('%Y%m%d-%H%M%S')
@@ -516,7 +560,13 @@ def save_config(config, config_path=None):
             except OSError:
                 pass
 
-def update_config(new_config):
+
+def save_config(config, config_path=None):
+    """Serialize config writes and delegate to the atomic writer."""
+    with _CONFIG_IO_LOCK:
+        return _save_config_unlocked(config, config_path)
+
+def _update_config_unlocked(new_config):
     """
     更新配置
     
@@ -586,6 +636,12 @@ def update_config(new_config):
     save_config(current_config, config_path)
     
     return current_config
+
+
+def update_config(new_config):
+    """Atomically merge a partial settings update with the latest config."""
+    with _CONFIG_IO_LOCK:
+        return _update_config_unlocked(new_config)
 
 def reset_specific_config(keys):
     """
