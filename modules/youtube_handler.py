@@ -327,11 +327,15 @@ def _build_subtitle_download_args(
     if not bool((config or {}).get('YOUTUBE_AUTO_GENERATED_SUBTITLES_ENABLED', False)):
         return ['--no-write-subs']
 
+    # 只下载后续流程真正会使用的字幕。下载全部自动字幕会对同一视频
+    # 发起上百次请求，容易触发 YouTube 429；而 yt-dlp 直接转出的 SRT
+    # 还会丢失 VTT 的行内时间戳，使滚动字幕无法正确去重和重建节奏。
+    # 保留 VTT，交给 task_manager 的 YouTube VTT 清洗器统一转换。
     return [
         '--write-subs',
-        '--all-subs',
-        '--convert-subs', 'srt',
         '--write-auto-subs',
+        '--sub-langs', 'zh-Hans,zh-CN,zh,en-orig,en',
+        '--sub-format', 'vtt',
     ]
 
 
@@ -1372,4 +1376,3 @@ def extract_video_urls_from_playlist(playlist_url, cookies_file_path=None):
     except Exception as e:
         logger.error(f"extract_video_urls_from_playlist异常: {str(e)}")
     return video_urls
-

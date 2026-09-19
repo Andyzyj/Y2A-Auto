@@ -283,6 +283,35 @@ def _convert_vtt_text_to_srt_text(vtt_content: str) -> str:
     return '\n\n'.join(srt_blocks).strip()
 
 
+def _subtitle_language_tag(subtitle_path: str) -> str:
+    """Return the complete language tag encoded in a subtitle filename."""
+    try:
+        filename = os.path.basename(str(subtitle_path or ''))
+        stem = os.path.splitext(filename)[0]
+        parts = stem.split('.')
+        return parts[-1].strip().lower() if len(parts) >= 2 else 'auto'
+    except Exception:
+        return 'auto'
+
+
+def _subtitle_candidate_priority(subtitle_path: str) -> tuple[int, str]:
+    """Prefer Simplified Chinese, then source English, over Traditional Chinese."""
+    lang = _subtitle_language_tag(subtitle_path)
+    if lang in {'zh-hans', 'zh-cn', 'zh'}:
+        rank = 0
+    elif lang == 'en-orig':
+        rank = 1
+    elif lang == 'en' or lang.startswith('en-'):
+        rank = 2
+    elif lang in {'zh-hant', 'zh-tw', 'zh-hk'}:
+        rank = 3
+    elif lang.startswith('zh'):
+        rank = 4
+    else:
+        rank = 5
+    return rank, os.path.basename(str(subtitle_path or '')).lower()
+
+
 class TaskCancelledError(Exception):
     """任务取消异常，用于中断执行流程"""
 
@@ -3616,7 +3645,7 @@ class TaskProcessor:
             task_dir = os.path.join(DOWNLOADS_DIR, task_id)
             subtitle_files = []
             try:
-                for name in os.listdir(task_dir):
+                for name in sorted(os.listdir(task_dir)):
                     if not isinstance(name, str):
                         continue
                     lower = name.lower()
@@ -3796,12 +3825,17 @@ class TaskProcessor:
                         qc_cleared = True
                         qc_failed = False
             
-            # 优化选择策略：若有中文字幕则直接烧录；否则优先选英文字幕进行翻译
+            # 选择策略：简体中文字幕可直接烧录；繁体字幕不能冒充简体，
+            # 有英文原文时优先翻译英文。固定排序也避免 os.listdir 顺序改变结果。
+            subtitle_files.sort(key=_subtitle_candidate_priority)
             detected_list = []
             for f in subtitle_files:
                 lang = self._detect_subtitle_language(f)
                 detected_list.append((f, lang))
-            zh_candidates = [f for f, lang in detected_list if str(lang).lower().startswith('zh')]
+            zh_candidates = [
+                f for f, lang in detected_list
+                if str(lang).lower() in {'zh', 'zh-cn', 'zh-hans'}
+            ]
             en_candidates = [f for f, lang in detected_list if str(lang).lower().startswith('en')]
             
             if zh_candidates:
@@ -4334,18 +4368,7 @@ class TaskProcessor:
     
     def _detect_subtitle_language(self, subtitle_path):
         """从字幕文件名提取语言代码（如 video.ja.srt -> ja）"""
-        try:
-            filename = os.path.basename(subtitle_path)
-            name_without_ext = os.path.splitext(filename)[0]
-            parts = name_without_ext.split('.')
-            if len(parts) >= 2:
-                lang_code = parts[-1].lower()
-                if '-' in lang_code:
-                    lang_code = lang_code.split('-')[0]
-                return lang_code
-            return "auto"
-        except Exception:
-            return "auto"
+        return _subtitle_language_tag(subtitle_path)
     
     _KNOWN_HW_ENCODER_ERROR_PATTERNS = (
         # 软件编码器：libx265 不一定被编进用户的 FFmpeg（自备构建常见
