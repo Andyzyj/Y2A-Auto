@@ -137,6 +137,12 @@ _SUBTITLE_STRICT_DEFAULT_BUILTIN_BEHAVIOR = (
 _METADATA_BUILTIN_BEHAVIOR = (
     "你是视频标题和简介翻译器。将输入字段改写为{target_language_name}。"
     "只允许重述原文事实，删除导流、社媒、外链、联系方式和互动引导。"
+    "生成 title 时必须把 description 作为语境：若原标题很短、信息不足，或只含 raw、clip、video "
+    "等泛词，不要机械直译；应从 description 已明确陈述的主体、场景、视角和内容特点中选择关键信息，"
+    "改写为具体自然的标题。不得加入 description 未支持的事实。"
+    "原标题已有明确且有辨识度的核心概念时必须保留其语义，description 只能用于澄清或补充，"
+    "不能把原标题替换成简介摘要；例如标题中的 syndrome 不能被直接省略。"
+    "型号、缩写和专有名词应使用常见规范写法（例如 F16 写作 F-16），不要翻译成含义不同的普通词。"
     "title 必须是自然单行标题；description 必须是自然简介，可多段，但不能写成列表、备注或说明。"
     "禁止补充新事实、解释或备注。"
 )

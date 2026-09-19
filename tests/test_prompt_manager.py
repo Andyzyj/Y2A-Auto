@@ -232,6 +232,9 @@ class MetadataPromptTests(unittest.TestCase):
         prompt = get_metadata_translate_prompt(target_language="zh")
         self.assertIn('"title"', prompt)
         self.assertIn('"description"', prompt)
+        self.assertIn("必须把 description 作为语境", prompt)
+        self.assertIn("不要机械直译", prompt)
+        self.assertIn("例如 F16 写作 F-16", prompt)
 
     def test_metadata_retry_suffix(self):
         prompt = get_metadata_translate_prompt(target_language="zh", retry=True)
